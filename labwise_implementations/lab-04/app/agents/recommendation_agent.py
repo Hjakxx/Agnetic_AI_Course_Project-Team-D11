@@ -1,0 +1,150 @@
+
+from app.database.repositories import get_student
+from app.agents.risk_agent import analyze_student_risk
+from app.memory.intervention_memory import log_intervention, get_intervention_history
+from app.runtime.audit_logger import log_action
+
+
+def generate_recommendations(student):
+    """Generate an action plan based on student risk indicators."""
+    recommendations = []
+
+    if student["attendance"] < 60:
+        recommendations.append(
+            "Improve attendance and maintain at least 75% attendance."
+        )
+
+    if student["marks"] < 50:
+        recommendations.append(
+            "Attend academic support sessions and improve subject marks."
+        )
+
+    if student["assignments"] < 50:
+        recommendations.append(
+            "Complete pending assignments and maintain regular submission."
+        )
+
+    if student["backlogs"] >= 1:
+        recommendations.append(
+            "Focus on clearing the active backlog and maintain consistent study preparation."
+        )
+
+    if student["backlogs"] >= 2:
+        recommendations.append(
+            "Create a backlog clearance plan with mentor guidance."
+        )
+
+    if student["internship_status"] == "Not Started":
+        recommendations.append(
+            "Start the internship preparation process."
+        )
+
+    if student["placement_status"] == "Not Ready":
+        recommendations.append(
+            "Begin placement preparation and career guidance activities."
+        )
+
+    if not recommendations:
+        recommendations.append(
+            "Continue current academic and career preparation."
+        )
+
+    return recommendations
+
+
+def create_action_plan(student_id, risk_analysis=None, student=None):
+    """Create interventions only when the student is At Risk."""
+
+    student = get_student(student_id) if student is None else student
+
+    if not student:
+        log_action(
+            student_id,
+            "Recommendation Agent",
+            "create_action_plan",
+            "Student not found"
+        )
+        return {"error": "Student not found"}
+
+    # Use the supplied risk analysis; analyze only if it was not provided.
+    if risk_analysis is None:
+        risk_analysis = analyze_student_risk(student_id)
+
+    if not risk_analysis or risk_analysis.get("error"):
+        log_action(
+            student_id,
+            "Recommendation Agent",
+            "create_action_plan",
+            "Risk analysis unavailable"
+        )
+        return {"error": "Risk analysis unavailable"}
+
+    # Generate interventions only for students who are At Risk.
+    if risk_analysis.get("risk") != "At Risk":
+        log_action(
+            student["student_id"],
+            "Recommendation Agent",
+            "create_action_plan",
+            "No intervention required - student is not at risk"
+        )
+
+        return {
+            "student_id": student["student_id"],
+            "name": student["name"],
+            "risk": risk_analysis["risk"],
+            "risk_probability": risk_analysis["risk_probability"],
+            "recommendations": [],
+            "interventions": [],
+            "mentor_approval_required": False,
+        }
+
+    recommendations = generate_recommendations(student)
+
+    history = {item["intervention"]: item for item in reversed(get_intervention_history(student_id))}
+    interventions = []
+    decisions = []
+    revised = []
+    for proposal in recommendations:
+        prior = history.get(proposal, {})
+        if prior.get("status") == "rejected":
+            feedback = prior.get("mentor_feedback", "").lower()
+            if any(word in feedback for word in ("schedule", "time", "clash")):
+                alternative = "Arrange an asynchronous check-in and agree on an available time with the mentor."
+            else:
+                alternative = "Meet with the mentor to choose an alternative to this plan: " + proposal
+            decisions.append("Revised after mentor feedback: " + proposal)
+            proposal = alternative
+        if history.get(proposal, {}).get("status") == "rejected":
+            decisions.append("A new plan needs mentor clarification.")
+            continue
+        if history.get(proposal, {}).get("status") == "approved":
+            decisions.append("Follow up on the approved plan: " + proposal)
+        if proposal not in revised:
+            revised.append(proposal)
+    recommendations = revised
+
+    for recommendation in recommendations:
+        interventions.append(
+            log_intervention(
+                student_id=student_id,
+                intervention=recommendation
+            )
+        )
+
+    log_action(
+        student["student_id"],
+        "Recommendation Agent",
+        "create_action_plan",
+        f"{len(recommendations)} recommendations generated"
+    )
+
+    return {
+        "student_id": student["student_id"],
+        "name": student["name"],
+        "risk": risk_analysis["risk"],
+        "risk_probability": risk_analysis["risk_probability"],
+        "recommendations": recommendations,
+        "interventions": interventions,
+        "decisions": decisions,
+        "mentor_approval_required": any(i["status"] == "pending" for i in interventions),
+    }
